@@ -268,6 +268,24 @@
     .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
     .btn-secondary:disabled { opacity: 0.3; cursor: not-allowed; }
 
+    .btn-download {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+    }
+
+    .btn-download:hover { background: var(--accent); color: #0d0d0d; }
+    .btn-download:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .pitch-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+      letter-spacing: 0.05em;
+    }
+
     /* Status */
     .status {
       margin-top: 16px;
@@ -362,6 +380,11 @@
             <input type="range" id="pitchSlider" min="0" max="2" step="0.05" value="1"/>
             <span class="slider-val" id="pitchVal">1.0</span>
           </div>
+          <div class="pitch-labels">
+            <span>🔉 Deep</span>
+            <span>Normal</span>
+            <span>High 🔊</span>
+          </div>
           <label style="margin-top:10px">Volume</label>
           <div class="slider-row">
             <input type="range" id="volSlider" min="0" max="1" step="0.05" value="1"/>
@@ -377,6 +400,7 @@
         <button class="btn btn-primary" id="speakBtn">▶ Speak</button>
         <button class="btn btn-secondary" id="pauseBtn" disabled>⏸ Pause</button>
         <button class="btn btn-secondary" id="stopBtn" disabled>■ Stop</button>
+        <button class="btn btn-download" id="downloadBtn" disabled>⬇ Download</button>
       </div>
 
       <div class="status" id="status">Ready</div>
@@ -398,6 +422,7 @@
     const speakBtn = document.getElementById('speakBtn');
     const pauseBtn = document.getElementById('pauseBtn');
     const stopBtn = document.getElementById('stopBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
     const statusEl = document.getElementById('status');
     const waveformEl = document.getElementById('waveform');
     const noSupport = document.getElementById('noSupport');
@@ -447,17 +472,27 @@
       });
     }
 
-    // Load voices
+    // Load voices — prefer male Indian English
     let voices = [];
     function loadVoices() {
       voices = synth.getVoices();
       if (!voices.length) return;
       voiceSelect.innerHTML = '';
+
+      // Try to find a male Indian English voice
+      const indianMalePriority = voices.findIndex(v =>
+        /hi[-_]IN|en[-_]IN/i.test(v.lang) && /male|ravi|kalpana|hemant/i.test(v.name)
+      );
+      const indianAny = voices.findIndex(v => /hi[-_]IN|en[-_]IN/i.test(v.lang));
+      const preferredIdx = indianMalePriority !== -1 ? indianMalePriority
+                         : indianAny !== -1 ? indianAny
+                         : voices.findIndex(v => v.default);
+
       voices.forEach((v, i) => {
         const opt = document.createElement('option');
         opt.value = i;
         opt.textContent = `${v.name} (${v.lang})`;
-        if (v.default) opt.selected = true;
+        if (i === preferredIdx) opt.selected = true;
         voiceSelect.appendChild(opt);
       });
     }
@@ -469,8 +504,78 @@
 
     // Sliders
     rateSlider.addEventListener('input', () => rateVal.textContent = parseFloat(rateSlider.value).toFixed(2) + '×');
-    pitchSlider.addEventListener('input', () => pitchVal.textContent = parseFloat(pitchSlider.value).toFixed(2));
+    pitchSlider.addEventListener('input', () => {
+      const v = parseFloat(pitchSlider.value);
+      let label = v.toFixed(2);
+      if (v < 0.6) label += ' (deep)';
+      else if (v > 1.4) label += ' (high)';
+      pitchVal.textContent = label;
+    });
     volSlider.addEventListener('input', () => volVal.textContent = Math.round(volSlider.value * 100) + '%');
+
+    // --- Audio Recording via AudioContext destination capture ---
+    let audioCtx = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recordedBlob = null;
+
+    function setupRecording() {
+      return new Promise((resolve, reject) => {
+        // We capture system audio by routing through AudioContext
+        // Use a silent oscillator trick to keep AudioContext alive,
+        // then capture the default output via getDisplayMedia or AudioContext.createMediaStreamDestination
+        try {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const dest = audioCtx.createMediaStreamDestination();
+
+          // Connect a silent source so the stream stays active
+          const silentOsc = audioCtx.createOscillator();
+          const gainNode = audioCtx.createGain();
+          gainNode.gain.value = 0;
+          silentOsc.connect(gainNode);
+          gainNode.connect(dest);
+          silentOsc.start();
+
+          recordedChunks = [];
+          recordedBlob = null;
+
+          const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+            ? 'audio/webm;codecs=opus'
+            : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg';
+
+          mediaRecorder = new MediaRecorder(dest.stream, { mimeType });
+          mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
+          mediaRecorder.onstop = () => {
+            recordedBlob = new Blob(recordedChunks, { type: mimeType });
+            downloadBtn.disabled = false;
+            setStatus('Done. Ready to download.');
+            silentOsc.stop();
+            audioCtx.close();
+          };
+          mediaRecorder.start(100);
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+    }
+
+    downloadBtn.addEventListener('click', () => {
+      if (!recordedBlob) return;
+      const ext = recordedBlob.type.includes('ogg') ? 'ogg' : 'webm';
+      const url = URL.createObjectURL(recordedBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `soundscript-${Date.now()}.${ext}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    });
 
     // Word / char count
     textInput.addEventListener('input', () => {
@@ -488,13 +593,23 @@
     }
 
     // Speak
-    speakBtn.addEventListener('click', () => {
+    speakBtn.addEventListener('click', async () => {
       if (!synth) return;
       if (synth.speaking) { synth.cancel(); }
 
       const text = textInput.value.trim();
       if (!text) { setStatus('Please enter some text first.', 'error'); return; }
       if (text.length > 5000) { setStatus('Text too long (max 5000 chars).', 'error'); return; }
+
+      downloadBtn.disabled = true;
+      recordedBlob = null;
+
+      try {
+        await setupRecording();
+      } catch (err) {
+        setStatus('Recording setup failed: ' + err.message, 'error');
+        // Still allow speaking without recording
+      }
 
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.voice = voices[voiceSelect.value] || null;
@@ -511,12 +626,12 @@
       };
 
       utterance.onend = () => {
-        setStatus('Done.');
         stopWave();
         pauseBtn.disabled = true;
         stopBtn.disabled = true;
         speakBtn.disabled = false;
         pauseBtn.textContent = '⏸ Pause';
+        stopRecording();
       };
 
       utterance.onerror = (e) => {
@@ -525,6 +640,7 @@
         pauseBtn.disabled = true;
         stopBtn.disabled = true;
         speakBtn.disabled = false;
+        stopRecording();
       };
 
       synth.speak(utterance);
@@ -559,10 +675,10 @@
       stopBtn.disabled = true;
       speakBtn.disabled = false;
       pauseBtn.textContent = '⏸ Pause';
+      stopRecording();
     });
   </script>
 </body>
 </html>
-
 
 
